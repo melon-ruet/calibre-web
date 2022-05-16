@@ -101,7 +101,7 @@ class Goodreads(Metadata):
 
     def parse_publisher_and_date(self, soup):
         publisher = None
-        pub_date = None
+        pubdate_text = None
         publisher_node = soup.find("div", attrs={"id": "metacol"}).find(
             "div", attrs={"id": "details"})
         if publisher_node:
@@ -137,9 +137,7 @@ class Goodreads(Metadata):
                         pass
                     else:
                         pubdate_text = first_pubdate_text
-            if pubdate_text:
-                pub_date = self._convert_date_text(pubdate_text)
-        return publisher, pub_date
+        return publisher, pubdate_text
 
     def parse_rating(self, soup):
         rating_node = soup.find("span", attrs={"itemprop": "ratingValue"})
@@ -162,7 +160,8 @@ class Goodreads(Metadata):
                 "class": "authorName__container"})
         ]
         description = soup.find("div", attrs={"id": "description"})
-        description = description.find("span", attrs={"style": "display: none"})
+        if description:
+            description = description.find("span", attrs={"style": "display: none"})
         series = soup.find("h2", attrs={"id": "bookSeries"}).find(
             "a", attrs={"class": "greyText"})
         series_index = None
