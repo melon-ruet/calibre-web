@@ -17,12 +17,14 @@
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 import concurrent.futures
+import datetime
+import re
+from typing import List, Optional
 from urllib.parse import quote
 
+import pytz
 import requests
 from bs4 import BeautifulSoup as BS
-from operator import itemgetter
-from typing import List, Optional
 
 from cps import logger
 from cps.services.Metadata import MetaRecord, MetaSourceInfo, Metadata
@@ -34,86 +36,7 @@ class Goodreads(Metadata):
     __name__ = "Goodreads"
     __id__ = "goodreads"
     BASE_URL = "https://www.goodreads.com"
-    # headers = {"upgrade-insecure-requests": "1",
-    #            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36",
-    #            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-    #            "sec-gpc": "1",
-    #            "sec-fetch-site": "none",
-    #            "sec-fetch-mode": "navigate",
-    #            "sec-fetch-user": "?1",
-    #            "sec-fetch-dest": "document",
-    #            "accept-encoding": "gzip, deflate, br",
-    #            "accept-language": "en-US,en;q=0.9"}
     session = requests.Session()
-
-    # session.headers = headers
-
-    def inner(self, link, index) -> [dict, int]:
-        with self.session as session:
-            try:
-                r = session.get(f"https://www.amazon.com/{link}")
-                r.raise_for_status()
-            except Exception as ex:
-                log.warning(ex)
-                return
-            long_soup = BS(r.text, "lxml")  # ~4sec :/
-            soup2 = long_soup.find("div", attrs={
-                "cel_widget_id": "dpx-books-ppd_csm_instrumentation_wrapper"})
-            if soup2 is None:
-                return
-            try:
-                match = MetaRecord(
-                    title="",
-                    authors="",
-                    source=MetaSourceInfo(
-                        id=self.__id__,
-                        description="Amazon Books",
-                        link="https://amazon.com/"
-                    ),
-                    url=f"https://www.amazon.com{link}",
-                    # the more searches the slower, these are too hard to find in reasonable time or might not even exist
-                    publisher="",  # very unreliable
-                    publishedDate="",  # very unreliable
-                    id=None,  # ?
-                    tags=[]  # dont exist on amazon
-                )
-
-                try:
-                    match.description = "\n".join(
-                        soup2.find("div", attrs={
-                            "data-feature-name": "bookDescription"}).stripped_strings) \
-                                            .replace("\xa0", " ")[:-9].strip().strip("\n")
-                except (AttributeError, TypeError):
-                    return None  # if there is no description it is not a book and therefore should be ignored
-                try:
-                    match.title = soup2.find("span", attrs={"id": "productTitle"}).text
-                except (AttributeError, TypeError):
-                    match.title = ""
-                try:
-                    match.authors = [next(
-                        filter(lambda i: i != " " and i != "\n" and not i.startswith("{"),
-                               x.findAll(text=True))).strip()
-                                     for x in
-                                     soup2.findAll("span", attrs={"class": "author"})]
-                except (AttributeError, TypeError, StopIteration):
-                    match.authors = ""
-                try:
-                    match.rating = int(
-                        soup2.find("span", class_="a-icon-alt").text.split(" ")[0].split(
-                            ".")[
-                            0])  # first number in string
-                except (AttributeError, ValueError):
-                    match.rating = 0
-                try:
-                    match.cover = \
-                        soup2.find("img", attrs={"class": "a-dynamic-image frontImage"})[
-                            "src"]
-                except (AttributeError, TypeError):
-                    match.cover = ""
-                return match, index
-            except Exception as e:
-                log.error_or_exception(e)
-                return
 
     def get_goodreads_search_url(self, query):
         title_tokens = list(self.get_title_tokens(query, strip_joiners=False))
@@ -126,7 +49,6 @@ class Goodreads(Metadata):
 
     def query_goodreads(self, url):
         try:
-            # results = self.session.get(url, headers=self.headers)
             response = self.session.get(url)
             response.raise_for_status()
             return response
@@ -137,15 +59,12 @@ class Goodreads(Metadata):
             log.warning(e)
             return None
 
-        # Now grab the first value from the search results, provided the
-        # title and authors appear to be for the same book
-        # self._parse_search_results(log, title, authors, root, matches, timeout)
-
     def parse_book_urls(self, html_text):
         soup = BS(html_text, "html.parser")
 
         urls = []
-        book_html_tags = soup.findAll("a", attrs={"class": "bookTitle", "itemprop": "url"})
+        book_html_tags = soup.findAll(
+            "a", attrs={"class": "bookTitle", "itemprop": "url"})
         if not book_html_tags:
             log.warning("No book found or books parsing error")
             return urls
@@ -158,19 +77,105 @@ class Goodreads(Metadata):
 
         return urls
 
+    def _convert_date_text(self, date_text):
+        # Note that the date text could be "2003", "December 2003" or "December 10th 2003"
+        year = int(date_text[-4:])
+        month = 1
+        day = 1
+        if len(date_text) > 4:
+            text_parts = date_text[:len(date_text) - 5].partition(' ')
+            month_name = text_parts[0]
+            # Need to convert the month name into a numeric value
+            # For now I am "assuming" the Goodreads website only displays in English
+            # If it doesn't will just fallback to assuming January
+            month_dict = {
+                "January": 1, "February": 2, "March": 3, "April": 4, "May": 5,
+                "June": 6,
+                "July": 7, "August": 8, "September": 9, "October": 10,
+                "November": 11, "December": 12
+            }
+            month = month_dict.get(month_name, 1)
+            if len(text_parts[2]) > 0:
+                day = int(re.match('(\d+)', text_parts[2]).groups(0)[0])
+        return datetime.datetime(year, month, day, tzinfo=pytz.UTC)
+
+    def parse_publisher_and_date(self, soup):
+        publisher = None
+        pub_date = None
+        publisher_node = soup.find("div", attrs={"id": "metacol"}).find(
+            "div", attrs={"id": "details"})
+        if publisher_node:
+            # Publisher is specified within the div above with variations of:
+            #  Published December 2003 by Books On Tape <nobr class="greyText">(first published 1982)</nobr>
+            #  Published June 30th 2010
+            # Note that the date could be "2003", "December 2003" or "December 10th 2003"
+            publisher_node_text = publisher_node.findAll("div")[1].text
+            # See if we can find the publisher name
+            pub_text_parts = publisher_node_text.partition(' by ')
+            if pub_text_parts[2]:
+                publisher = pub_text_parts[2].strip()
+                if '(first' in publisher:
+                    # The publisher name is followed by (first published xxx) so strip that off
+                    publisher = publisher.rpartition('(first')[0].strip()
+
+            # Now look for the pubdate. There should always be one at start of the string
+            pubdate_text_match = re.search('Published[\n\s]*([\w\s]+)',
+                                           pub_text_parts[0].strip())
+            pubdate_text = None
+            if pubdate_text_match is not None:
+                pubdate_text = pubdate_text_match.groups(0)[0]
+            # If we have a first published section of text use that for the date.
+            if '(first' in publisher_node_text:
+                # For the publication date we will use first published date
+                # Note this date could be just a year, or it could be monthname year
+                pubdate_text_match = re.search('.*\(first published ([\w\s]+)',
+                                               publisher_node_text)
+                if pubdate_text_match is not None:
+                    first_pubdate_text = pubdate_text_match.groups(0)[0]
+                    if pubdate_text and first_pubdate_text[-4:] == pubdate_text[-4:]:
+                        # We have same years, use the first date as it could be more accurate
+                        pass
+                    else:
+                        pubdate_text = first_pubdate_text
+            if pubdate_text:
+                pub_date = self._convert_date_text(pubdate_text)
+        return publisher, pub_date
+
+    def parse_rating(self, soup):
+        rating_node = soup.find("span", attrs={"itemprop": "ratingValue"})
+        if rating_node and len(rating_node) > 0:
+            try:
+                rating_text = rating_node.text.strip("\n").strip()
+                return float(rating_text)
+            except (AttributeError, ValueError):
+                log.error("parse_rating: Exception getting rating")
+        return None
+
     def get_book_metarecord(self, url):
         response = self.query_goodreads(url)
         soup = BS(response.text, "html.parser")
         title = soup.find("h1", attrs={"id": "bookTitle"}).text.strip("\n").strip()
         authors = [
-            author_tag.find("span").text.strip("\n").strip()
-            for author_tag in
-            soup.find("div", attrs={"id": "bookAuthors"}).findAll("div", attrs={"class": "authorName__container"})
+            author_node.find("span").text.strip("\n").strip()
+            for author_node in
+            soup.find("div", attrs={"id": "bookAuthors"}).findAll("div", attrs={
+                "class": "authorName__container"})
         ]
-        cover = soup.find("img", attrs={"id": "coverImage"})["src"]
         description = soup.find("div", attrs={"id": "description"})
-        description =    description.find("span", attrs={"style": "display: none"})
-        return MetaRecord(
+        description = description.find("span", attrs={"style": "display: none"})
+        series = soup.find("h2", attrs={"id": "bookSeries"}).find(
+            "a", attrs={"class": "greyText"})
+        series_index = None
+        if series:
+            series_splitted = series.text.split("#")
+            series = series_splitted[0].strip("\n").strip()
+            try:
+                series_index = int(series_splitted[1].strip("\n").strip())
+            except (IndexError, ValueError):
+                log.error("Can not retrieve series index")
+        publisher, publish_date = self.parse_publisher_and_date(soup)
+        rating = self.parse_rating(soup)
+        meta_record = MetaRecord(
             id="",
             title=title,
             authors=authors,
@@ -180,17 +185,22 @@ class Goodreads(Metadata):
                 description="Goodreads",
                 link=self.BASE_URL
             ),
-            cover=cover,
             description=description,
-            series="",
-            series_index=None,
+            series=series,
+            series_index=series_index,
             identifiers={},
-            publisher="",
-            publishedDate="",
-            rating=0,
+            publisher=publisher,
+            publishedDate=publish_date,
+            rating=rating,
             languages=[],
             tags=[]
         )
+
+        cover = soup.find("img", attrs={"id": "coverImage"})
+        if cover:
+            meta_record.cover = cover["src"]
+
+        return meta_record
 
     def search(
         self, query: str, generic_cover: str = "", locale: str = "en"
@@ -203,14 +213,15 @@ class Goodreads(Metadata):
                 urls = self.parse_book_urls(response.text)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                     fut = {executor.submit(self.get_book_metarecord, url) for url in urls}
-                    val = list(map(lambda x: x.result(), concurrent.futures.as_completed(fut)))
+                    val = list(
+                        map(lambda x: x.result(), concurrent.futures.as_completed(fut)))
             else:
                 log.error("Goodreads get books failed")
 
         return val
 
-
-if __name__ == "__main__":
-    goodreads = Goodreads()
-    res = goodreads.search(
-        "A Mind for Numbers: How to Excel at Math and Science (Even If You Flunked Algebra)")
+#
+# if __name__ == "__main__":
+#     goodreads = Goodreads()
+#     res = goodreads.search(
+#         "A Mind for Numbers: How to Excel at Math and Science (Even If You Flunked Algebra)")
